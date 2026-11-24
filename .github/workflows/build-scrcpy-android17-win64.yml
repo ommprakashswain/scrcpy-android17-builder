@@ -1,4 +1,4 @@
-name: Build scrcpy Android 17 (Windows x64)
+name: Build scrcpy Android 17 (Windows x64, uploaded ZIP inputs)
 
 on:
   workflow_dispatch:
@@ -13,87 +13,84 @@ concurrency:
 jobs:
   build-win64:
     name: Build patched Windows x64 package
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       VERSION: 5.0.1-android17-pr7127
-      GRADLE: ./gradlew
 
     steps:
-      - name: Checkout PR #7127 patched source
-        uses: actions/checkout@v6
+      - name: Check out this builder repository
+        uses: actions/checkout@v7
         with:
-          repository: KimGLee/scrcpy
-          # PR #7127 head commit as of 2026-11-24; pin for reproducibility.
-          ref: 007dfd8a7e4e1a2b218b6957f6f1198792b0d195
-          path: scrcpy-src
           persist-credentials: false
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v5
-        with:
-          distribution: zulu
-          java-version: '17'
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Windows cross-build dependencies
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            autoconf automake build-essential cmake curl file git libtool \
-            libz-mingw-w64-dev make meson mingw-w64 mingw-w64-tools \
-            nasm ninja-build pkg-config unzip wget zip
-
-      - name: Install Android SDK platform required by scrcpy-server
-        shell: bash
-        run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager \
-            'platform-tools' \
-            'platforms;android-36' \
-            'build-tools;36.0.0'
-
-      - name: Build patched Android server
-        working-directory: scrcpy-src
-        shell: bash
-        run: release/build_server.sh
-
-      - name: Build portable Windows x64 client
-        working-directory: scrcpy-src
-        shell: bash
-        run: release/build_windows.sh 64
-
-      - name: Package matching client and server
-        working-directory: scrcpy-src
-        shell: bash
-        run: release/package_client.sh win64 zip
-
-      - name: Verify package contents and patched option
-        working-directory: scrcpy-src
+      - name: Verify and extract BOTH uploaded ZIP files
         shell: bash
         run: |
           set -euo pipefail
-          PACKAGE="release/output/scrcpy-win64-${VERSION}.zip"
-          CLIENT="release/work/build-win64/dist/scrcpy.exe"
-          SERVER="release/work/build-server/server/scrcpy-server"
 
-          test -s "$CLIENT"
-          test -s "$SERVER"
-          test -s "$PACKAGE"
-          grep -F -- '--vd-enable-freeform' app/src/cli.c
-          strings "$CLIENT" | grep -F -- '--vd-enable-freeform'
-          file "$CLIENT"
-          x86_64-w64-mingw32-objdump -f "$CLIENT" | grep -E 'pei-x86-64|architecture: i386:x86-64'
-          unzip -l "$PACKAGE" | grep -E 'scrcpy.exe|scrcpy-server|adb.exe|SDL3.dll'
+          PATCH_ZIP="scrcpy-fix-android17-virtual-display-launch.zip"
+          ORIGINAL_ZIP="scrcpy-win64-v5.0.1.zip"
 
-      - name: Upload portable Windows x64 ZIP
-        uses: actions/upload-artifact@v7
+          for archive in "$PATCH_ZIP" "$ORIGINAL_ZIP"; do
+            if [[ ! -s "$archive" ]]; then
+              echo "ERROR: Missing $archive in the repository root."
+              echo "Upload both ZIP files to the top level of this GitHub repository, then rerun the workflow."
+              exit 1
+            fi
+            unzip -t "$archive" >/dev/null
+          done
+
+          # These hashes identify the exact two files supplied for this build.
+          echo "e35559a5947a6bf85638e19eba66cc06631965ded9ba978bd313beb54c8d783b  $PATCH_ZIP" | sha256sum -c -
+          echo "b12a2c4ee8be317422451fc7dcf8ee20a71b5ea7ef9ad73ddd825a25316227a5  $ORIGINAL_ZIP" | sha256sum -c -
+
+          mkdir -p "$RUNNER_TEMP/patch-unpack" "$RUNNER_TEMP/original-unpack"
+          unzip -q "$PATCH_ZIP" -d "$RUNNER_TEMP/patch-unpack"
+          unzip -q "$ORIGINAL_ZIP" -d "$RUNNER_TEMP/original-unpack"
+
+          PATCH_ROOT="$(find "$RUNNER_TEMP/patch-unpack" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          ORIGINAL_ROOT="$(find "$RUNNER_TEMP/original-unpack" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+
+          test -n "$PATCH_ROOT"
+          test -n "$ORIGINAL_ROOT"
+
+          # Make sure the fixed ZIP is a complete scrcpy source tree with the PR option.
+          test -s "$PATCH_ROOT/gradlew"
+          test -s "$PATCH_ROOT/release/build_server.sh"
+          test -s "$PATCH_ROOT/release/build_windows.sh"
+          test -s "$PATCH_ROOT/release/package_client.sh"
+          test -s "$PATCH_ROOT/server/build.gradle"
+          grep -F -- '--vd-enable-freeform' "$PATCH_ROOT/app/src/cli.c"
+          grep -F 'vdEnableFreeform' "$PATCH_ROOT/server/src/main/java/com/genymobile/scrcpy/Options.java"
+
+          # Make sure the original Windows distribution is intact and usable as the baseline reference.
+          for file in scrcpy.exe scrcpy-server adb.exe AdbWinApi.dll AdbWinUsbApi.dll SDL3.dll; do
+            test -s "$ORIGINAL_ROOT/$file"
+          done
+
+          echo "SCRCPY_SOURCE_DIR=$PATCH_ROOT" >> "$GITHUB_ENV"
+          echo "ORIGINAL_BASELINE_DIR=$ORIGINAL_ROOT" >> "$GITHUB_ENV"
+          echo "PATCH_ZIP_SHA256=$(sha256sum "$PATCH_ZIP" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "ORIGINAL_ZIP_SHA256=$(sha256sum "$ORIGINAL_ZIP" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+          echo "Both supplied archives were verified and extracted."
+          echo "Patched source: $PATCH_ROOT"
+          echo "Original distribution baseline: $ORIGINAL_ROOT"
+
+      - name: Set up Java 17 for the Android server build
+        uses: actions/setup-java@v6
         with:
-          name: scrcpy-android17-windows-x64
-          path: scrcpy-src/release/output/scrcpy-win64-5.0.1-android17-pr7127.zip
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 14
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK platform 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
