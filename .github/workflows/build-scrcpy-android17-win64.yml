@@ -1,6 +1,6 @@
-name: Build scrcpy Android 17 (Windows x64, uploaded ZIP inputs)
+name: Build scrcpy Android 17 (Windows x64)
 
-on:
+"on":
   workflow_dispatch:
 
 permissions:
@@ -12,85 +12,85 @@ concurrency:
 
 jobs:
   build-win64:
-    name: Build patched Windows x64 package
+    name: Download sources, build and package Windows x64
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       VERSION: 5.0.1-android17-pr7127
+      PATCH_URL: https://codeload.github.com/KimGLee/scrcpy/zip/refs/heads/fix/android17-virtual-display-launch
+      ORIGINAL_URL: https://github.com/Genymobile/scrcpy/releases/download/v5.0.1/scrcpy-win64-v5.0.1.zip
+      # SHA-256 values of the exact two archives previously supplied in this chat.
+      # The original is the official scrcpy v5.0.1 Windows x64 release archive.
+      PATCH_SHA256: e35559a5947a6bf85638e19eba66cc06631965ded9ba978bd313beb54c8d783b
+      ORIGINAL_SHA256: b12a2c4ee8be317422451fc7dcf8ee20a71b5ea7ef9ad73ddd825a25316227a5
 
     steps:
-      - name: Check out this builder repository
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Verify and extract BOTH uploaded ZIP files
+      - name: Install native Windows cross-compilation dependencies
         shell: bash
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake autopoint binutils build-essential cmake curl \
+            file gettext git libtool libtool-bin libz-mingw-w64-dev make \
+            meson mingw-w64 mingw-w64-tools nasm ninja-build perl pkg-config \
+            python3 unzip wget zip
 
-          PATCH_ZIP="scrcpy-fix-android17-virtual-display-launch.zip"
-          ORIGINAL_ZIP="scrcpy-win64-v5.0.1.zip"
-
-          for archive in "$PATCH_ZIP" "$ORIGINAL_ZIP"; do
-            if [[ ! -s "$archive" ]]; then
-              echo "ERROR: Missing $archive in the repository root."
-              echo "Upload both ZIP files to the top level of this GitHub repository, then rerun the workflow."
-              exit 1
-            fi
-            unzip -t "$archive" >/dev/null
-          done
-
-          # These hashes identify the exact two files supplied for this build.
-          echo "e35559a5947a6bf85638e19eba66cc06631965ded9ba978bd313beb54c8d783b  $PATCH_ZIP" | sha256sum -c -
-          echo "b12a2c4ee8be317422451fc7dcf8ee20a71b5ea7ef9ad73ddd825a25316227a5  $ORIGINAL_ZIP" | sha256sum -c -
-
-          mkdir -p "$RUNNER_TEMP/patch-unpack" "$RUNNER_TEMP/original-unpack"
-          unzip -q "$PATCH_ZIP" -d "$RUNNER_TEMP/patch-unpack"
-          unzip -q "$ORIGINAL_ZIP" -d "$RUNNER_TEMP/original-unpack"
-
-          PATCH_ROOT="$(find "$RUNNER_TEMP/patch-unpack" -mindepth 1 -maxdepth 1 -type d -print -quit)"
-          ORIGINAL_ROOT="$(find "$RUNNER_TEMP/original-unpack" -mindepth 1 -maxdepth 1 -type d -print -quit)"
-
-          test -n "$PATCH_ROOT"
-          test -n "$ORIGINAL_ROOT"
-
-          # Make sure the fixed ZIP is a complete scrcpy source tree with the PR option.
-          test -s "$PATCH_ROOT/gradlew"
-          test -s "$PATCH_ROOT/release/build_server.sh"
-          test -s "$PATCH_ROOT/release/build_windows.sh"
-          test -s "$PATCH_ROOT/release/package_client.sh"
-          test -s "$PATCH_ROOT/server/build.gradle"
-          grep -F -- '--vd-enable-freeform' "$PATCH_ROOT/app/src/cli.c"
-          grep -F 'vdEnableFreeform' "$PATCH_ROOT/server/src/main/java/com/genymobile/scrcpy/Options.java"
-
-          # Make sure the original Windows distribution is intact and usable as the baseline reference.
-          for file in scrcpy.exe scrcpy-server adb.exe AdbWinApi.dll AdbWinUsbApi.dll SDL3.dll; do
-            test -s "$ORIGINAL_ROOT/$file"
-          done
-
-          echo "SCRCPY_SOURCE_DIR=$PATCH_ROOT" >> "$GITHUB_ENV"
-          echo "ORIGINAL_BASELINE_DIR=$ORIGINAL_ROOT" >> "$GITHUB_ENV"
-          echo "PATCH_ZIP_SHA256=$(sha256sum "$PATCH_ZIP" | cut -d' ' -f1)" >> "$GITHUB_ENV"
-          echo "ORIGINAL_ZIP_SHA256=$(sha256sum "$ORIGINAL_ZIP" | cut -d' ' -f1)" >> "$GITHUB_ENV"
-
-          echo "Both supplied archives were verified and extracted."
-          echo "Patched source: $PATCH_ROOT"
-          echo "Original distribution baseline: $ORIGINAL_ROOT"
-
-      - name: Set up Java 17 for the Android server build
-        uses: actions/setup-java@v6
+      - name: Set up Java 17 for the Android server
+        uses: actions/setup-java@v6.3.0
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@v4.0.4
 
-      - name: Install Android SDK platform 36
+      - name: Install Android SDK packages required by this source
         shell: bash
         run: |
           set -euo pipefail
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager \
+            'platform-tools' \
+            'platforms;android-36' \
+            'build-tools;36.0.0'
+
+      - name: Download BOTH source archives directly from their URLs
+        id: download-sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH_ZIP="$RUNNER_TEMP/scrcpy-fix-android17-virtual-display-launch.zip"
+          ORIGINAL_ZIP="$RUNNER_TEMP/scrcpy-win64-v5.0.1.zip"
+          PATCH_UNPACK="$RUNNER_TEMP/patch-source"
+          ORIGINAL_UNPACK="$RUNNER_TEMP/original-release"
+
+          echo "Downloading patched source from: $PATCH_URL"
+          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
+            "$PATCH_URL" --output "$PATCH_ZIP"
+
+          echo "Downloading official original Windows package from: $ORIGINAL_URL"
+          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
+            "$ORIGINAL_URL" --output "$ORIGINAL_ZIP"
+
+          echo "$PATCH_SHA256  $PATCH_ZIP" | sha256sum --check --status || {
+            echo "ERROR: The downloaded patch archive does not match the supplied PR #7127 ZIP checksum."
+            echo "The upstream branch may have changed since the archive was inspected. Review the new source before updating PATCH_SHA256."
+            sha256sum "$PATCH_ZIP"
+            exit 1
+          }
+
+          echo "$ORIGINAL_SHA256  $ORIGINAL_ZIP" | sha256sum --check --status || {
+            echo "ERROR: The downloaded original ZIP does not match the official v5.0.1 baseline checksum."
+            sha256sum "$ORIGINAL_ZIP"
+            exit 1
+          }
+
+          unzip -t "$PATCH_ZIP" >/dev/null
+          unzip -t "$ORIGINAL_ZIP" >/dev/null
+          mkdir -p "$PATCH_UNPACK" "$ORIGINAL_UNPACK"
+          unzip -q "$PATCH_ZIP" -d "$PATCH_UNPACK"
+          unzip -q "$ORIGINAL_ZIP" -d "$ORIGINAL_UNPACK"
+
+          PATCH_ROOT="$(find "$PATCH_UNPACK" -mindepth 1 -maxdepth 1 -type d -print -quit)"
