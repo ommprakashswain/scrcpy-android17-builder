@@ -1,4 +1,4 @@
-name: Build scrcpy Android 17 (Windows x64)
+name: FULL BUILD - scrcpy Android 17 (Windows x64)
 
 "on":
   workflow_dispatch:
