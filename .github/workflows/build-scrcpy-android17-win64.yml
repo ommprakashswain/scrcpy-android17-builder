@@ -1,96 +1,120 @@
-name: FULL BUILD - scrcpy Android 17 (Windows x64)
+          echo "$ORIGINAL_SHA256  $ORIGINAL_ZIP" | sha256sum --check
 
-"on":
-  workflow_dispatch:
+          unzip -t "$PATCH_ZIP"
+          unzip -t "$ORIGINAL_ZIP"
+          mkdir -p "$PATCH_DIR" "$ORIGINAL_DIR"
+          unzip -q "$PATCH_ZIP" -d "$PATCH_DIR"
+          unzip -q "$ORIGINAL_ZIP" -d "$ORIGINAL_DIR"
 
-permissions:
-  contents: read
+          PATCH_ROOT="$(find "$PATCH_DIR" -mindepth 1 -maxdepth 1 -type d -name 'scrcpy-*' -print -quit)"
+          ORIGINAL_ROOT="$(find "$ORIGINAL_DIR" -mindepth 1 -maxdepth 1 -type d -name 'scrcpy-win64-*' -print -quit)"
 
-concurrency:
-  group: scrcpy-android17-win64-${{ github.ref }}
-  cancel-in-progress: true
+          test -n "$PATCH_ROOT"
+          test -n "$ORIGINAL_ROOT"
+          test -f "$PATCH_ROOT/release/build_server.sh"
+          test -f "$PATCH_ROOT/release/build_windows.sh"
+          test -f "$PATCH_ROOT/release/package_client.sh"
+          test -s "$ORIGINAL_ROOT/scrcpy.exe"
+          test -s "$ORIGINAL_ROOT/scrcpy-server"
+          test -s "$ORIGINAL_ROOT/adb.exe"
+          test -s "$ORIGINAL_ROOT/AdbWinApi.dll"
+          test -s "$ORIGINAL_ROOT/AdbWinUsbApi.dll"
 
-jobs:
-  build-win64:
-    name: Download sources, build and package Windows x64
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    env:
-      VERSION: 5.0.1-android17-pr7127
-      PATCH_URL: https://codeload.github.com/KimGLee/scrcpy/zip/refs/heads/fix/android17-virtual-display-launch
-      ORIGINAL_URL: https://github.com/Genymobile/scrcpy/releases/download/v5.0.1/scrcpy-win64-v5.0.1.zip
-      # SHA-256 values of the exact two archives previously supplied in this chat.
-      # The original is the official scrcpy v5.0.1 Windows x64 release archive.
-      PATCH_SHA256: e35559a5947a6bf85638e19eba66cc06631965ded9ba978bd313beb54c8d783b
-      ORIGINAL_SHA256: b12a2c4ee8be317422451fc7dcf8ee20a71b5ea7ef9ad73ddd825a25316227a5
+          echo "PATCH_ROOT=$PATCH_ROOT" >> "$GITHUB_ENV"
+          echo "ORIGINAL_ROOT=$ORIGINAL_ROOT" >> "$GITHUB_ENV"
+          echo "Patched source extracted to: $PATCH_ROOT"
+          echo "Original release validated at: $ORIGINAL_ROOT"
 
-    steps:
-      - name: Install native Windows cross-compilation dependencies
+      - name: Run patched Android server checks
         shell: bash
         run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            autoconf automake autopoint binutils build-essential cmake curl \
-            file gettext git libtool libtool-bin libz-mingw-w64-dev make \
-            meson mingw-w64 mingw-w64-tools nasm ninja-build perl pkg-config \
-            python3 unzip wget zip
+          set -euxo pipefail
+          cd "$PATCH_ROOT"
+          export VERSION="$VERSION"
+          chmod +x gradlew release/*.sh app/deps/*.sh
+          release/test_server.sh
 
-      - name: Set up Java 17 for the Android server
-        uses: actions/setup-java@v6.3.0
+      - name: Build patched Android server
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$PATCH_ROOT"
+          export VERSION="$VERSION"
+          chmod +x gradlew release/*.sh app/deps/*.sh
+          release/build_server.sh
+          test -s "release/work/build-server/server/scrcpy-server"
+          echo 'Patched Android server build completed.'
+
+      - name: Cross-compile patched Windows x64 client
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$PATCH_ROOT"
+          export VERSION="$VERSION"
+          release/build_windows.sh 64
+          test -s "release/work/build-win64/dist/scrcpy.exe"
+          test -s "release/work/build-win64/dist/adb.exe"
+          test -s "release/work/build-win64/dist/AdbWinApi.dll"
+          test -s "release/work/build-win64/dist/AdbWinUsbApi.dll"
+          compgen -G 'release/work/build-win64/dist/*.dll' >/dev/null
+          echo 'Patched Windows x64 client build completed.'
+
+      - name: Package client and matching patched Android server
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$PATCH_ROOT"
+          export VERSION="$VERSION"
+          release/package_client.sh win64 zip
+
+          BUILT_PACKAGE="release/output/scrcpy-win64-${VERSION}.zip"
+          test -s "$BUILT_PACKAGE"
+          unzip -t "$BUILT_PACKAGE"
+
+          VERIFY_DIR="$RUNNER_TEMP/verify-package"
+          mkdir -p "$VERIFY_DIR"
+          unzip -q "$BUILT_PACKAGE" -d "$VERIFY_DIR"
+          PACKAGE_ROOT="$VERIFY_DIR/scrcpy-win64-${VERSION}"
+
+          test -s "$PACKAGE_ROOT/scrcpy.exe"
+          test -s "$PACKAGE_ROOT/scrcpy-server"
+          test -s "$PACKAGE_ROOT/adb.exe"
+          test -s "$PACKAGE_ROOT/AdbWinApi.dll"
+          test -s "$PACKAGE_ROOT/AdbWinUsbApi.dll"
+
+          # Confirm the Windows client contains the PR's opt-in CLI flag.
+          strings "$PACKAGE_ROOT/scrcpy.exe" | grep -F -- '--vd-enable-freeform'
+
+          # The patched server must be an APK archive containing its DEX bytecode.
+          unzip -t "$PACKAGE_ROOT/scrcpy-server"
+          unzip -l "$PACKAGE_ROOT/scrcpy-server" | grep -E 'classes[0-9]*\.dex'
+
+          # Ensure the original release archive was used as the baseline input.
+          file "$ORIGINAL_ROOT/scrcpy.exe" "$PACKAGE_ROOT/scrcpy.exe"
+
+          mkdir -p "$RUNNER_TEMP/final-output"
+          cp "$BUILT_PACKAGE" "$RUNNER_TEMP/final-output/scrcpy-android17-windows-x64.zip"
+          {
+            echo "Build version: $VERSION"
+            echo "Patch source URL: $PATCH_URL"
+            echo "Patch SHA-256: $PATCH_SHA256"
+            echo "Original baseline URL: $ORIGINAL_URL"
+            echo "Original baseline SHA-256: $ORIGINAL_SHA256"
+            echo "Build scripts: release/build_server.sh, release/build_windows.sh 64, release/package_client.sh win64 zip"
+            echo "Verified files: scrcpy.exe, scrcpy-server, adb.exe, AdbWinApi.dll, AdbWinUsbApi.dll"
+            echo "Verified CLI option: --vd-enable-freeform"
+            echo "Note: cloud build validation is not a device test on the Redmi Note 7 Pro."
+          } > "$RUNNER_TEMP/final-output/BUILD-INFO.txt"
+          sha256sum "$RUNNER_TEMP/final-output/scrcpy-android17-windows-x64.zip" \
+            > "$RUNNER_TEMP/final-output/SHA256SUMS.txt"
+
+      - name: Upload Windows x64 ZIP artifact
+        uses: actions/upload-artifact@v7
         with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4.0.4
-
-      - name: Install Android SDK packages required by this source
-        shell: bash
-        run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager \
-            'platform-tools' \
-            'platforms;android-36' \
-            'build-tools;36.0.0'
-
-      - name: Download BOTH source archives directly from their URLs
-        id: download-sources
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PATCH_ZIP="$RUNNER_TEMP/scrcpy-fix-android17-virtual-display-launch.zip"
-          ORIGINAL_ZIP="$RUNNER_TEMP/scrcpy-win64-v5.0.1.zip"
-          PATCH_UNPACK="$RUNNER_TEMP/patch-source"
-          ORIGINAL_UNPACK="$RUNNER_TEMP/original-release"
-
-          echo "Downloading patched source from: $PATCH_URL"
-          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
-            "$PATCH_URL" --output "$PATCH_ZIP"
-
-          echo "Downloading official original Windows package from: $ORIGINAL_URL"
-          curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
-            "$ORIGINAL_URL" --output "$ORIGINAL_ZIP"
-
-          echo "$PATCH_SHA256  $PATCH_ZIP" | sha256sum --check --status || {
-            echo "ERROR: The downloaded patch archive does not match the supplied PR #7127 ZIP checksum."
-            echo "The upstream branch may have changed since the archive was inspected. Review the new source before updating PATCH_SHA256."
-            sha256sum "$PATCH_ZIP"
-            exit 1
-          }
-
-          echo "$ORIGINAL_SHA256  $ORIGINAL_ZIP" | sha256sum --check --status || {
-            echo "ERROR: The downloaded original ZIP does not match the official v5.0.1 baseline checksum."
-            sha256sum "$ORIGINAL_ZIP"
-            exit 1
-          }
-
-          unzip -t "$PATCH_ZIP" >/dev/null
-          unzip -t "$ORIGINAL_ZIP" >/dev/null
-          mkdir -p "$PATCH_UNPACK" "$ORIGINAL_UNPACK"
-          unzip -q "$PATCH_ZIP" -d "$PATCH_UNPACK"
-          unzip -q "$ORIGINAL_ZIP" -d "$ORIGINAL_UNPACK"
-
-          PATCH_ROOT="$(find "$PATCH_UNPACK" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          name: scrcpy-android17-windows-x64
+          path: |
+            ${{ runner.temp }}/final-output/scrcpy-android17-windows-x64.zip
+            ${{ runner.temp }}/final-output/BUILD-INFO.txt
+            ${{ runner.temp }}/final-output/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
