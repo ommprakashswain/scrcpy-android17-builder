@@ -31,7 +31,7 @@ jobs:
         run: |
           chmod +x ./release/*.sh ./app/deps/*.sh
           ./release/build_server.sh
-          ./app/deps/dav1d.sh 64 cross shared
+          ./app/deps/dav1d.sh win64 cross shared
           ./release/build_windows.sh 64
           ./release/package_client.sh win64 zip
       - uses: actions/upload-artifact@v4
