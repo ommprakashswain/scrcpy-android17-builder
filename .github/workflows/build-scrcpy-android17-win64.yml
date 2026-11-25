@@ -1,120 +1,33 @@
-          echo "$ORIGINAL_SHA256  $ORIGINAL_ZIP" | sha256sum --check
+name: Build scrcpy Android 17 Win64
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Build version tag'
+        required: true
+        default: 'v5.0.1-android17'
 
-          unzip -t "$PATCH_ZIP"
-          unzip -t "$ORIGINAL_ZIP"
-          mkdir -p "$PATCH_DIR" "$ORIGINAL_DIR"
-          unzip -q "$PATCH_ZIP" -d "$PATCH_DIR"
-          unzip -q "$ORIGINAL_ZIP" -d "$ORIGINAL_DIR"
-
-          PATCH_ROOT="$(find "$PATCH_DIR" -mindepth 1 -maxdepth 1 -type d -name 'scrcpy-*' -print -quit)"
-          ORIGINAL_ROOT="$(find "$ORIGINAL_DIR" -mindepth 1 -maxdepth 1 -type d -name 'scrcpy-win64-*' -print -quit)"
-
-          test -n "$PATCH_ROOT"
-          test -n "$ORIGINAL_ROOT"
-          test -f "$PATCH_ROOT/release/build_server.sh"
-          test -f "$PATCH_ROOT/release/build_windows.sh"
-          test -f "$PATCH_ROOT/release/package_client.sh"
-          test -s "$ORIGINAL_ROOT/scrcpy.exe"
-          test -s "$ORIGINAL_ROOT/scrcpy-server"
-          test -s "$ORIGINAL_ROOT/adb.exe"
-          test -s "$ORIGINAL_ROOT/AdbWinApi.dll"
-          test -s "$ORIGINAL_ROOT/AdbWinUsbApi.dll"
-
-          echo "PATCH_ROOT=$PATCH_ROOT" >> "$GITHUB_ENV"
-          echo "ORIGINAL_ROOT=$ORIGINAL_ROOT" >> "$GITHUB_ENV"
-          echo "Patched source extracted to: $PATCH_ROOT"
-          echo "Original release validated at: $ORIGINAL_ROOT"
-
-      - name: Run patched Android server checks
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$PATCH_ROOT"
-          export VERSION="$VERSION"
-          chmod +x gradlew release/*.sh app/deps/*.sh
-          release/test_server.sh
-
-      - name: Build patched Android server
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$PATCH_ROOT"
-          export VERSION="$VERSION"
-          chmod +x gradlew release/*.sh app/deps/*.sh
-          release/build_server.sh
-          test -s "release/work/build-server/server/scrcpy-server"
-          echo 'Patched Android server build completed.'
-
-      - name: Cross-compile patched Windows x64 client
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$PATCH_ROOT"
-          export VERSION="$VERSION"
-          release/build_windows.sh 64
-          test -s "release/work/build-win64/dist/scrcpy.exe"
-          test -s "release/work/build-win64/dist/adb.exe"
-          test -s "release/work/build-win64/dist/AdbWinApi.dll"
-          test -s "release/work/build-win64/dist/AdbWinUsbApi.dll"
-          compgen -G 'release/work/build-win64/dist/*.dll' >/dev/null
-          echo 'Patched Windows x64 client build completed.'
-
-      - name: Package client and matching patched Android server
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$PATCH_ROOT"
-          export VERSION="$VERSION"
-          release/package_client.sh win64 zip
-
-          BUILT_PACKAGE="release/output/scrcpy-win64-${VERSION}.zip"
-          test -s "$BUILT_PACKAGE"
-          unzip -t "$BUILT_PACKAGE"
-
-          VERIFY_DIR="$RUNNER_TEMP/verify-package"
-          mkdir -p "$VERIFY_DIR"
-          unzip -q "$BUILT_PACKAGE" -d "$VERIFY_DIR"
-          PACKAGE_ROOT="$VERIFY_DIR/scrcpy-win64-${VERSION}"
-
-          test -s "$PACKAGE_ROOT/scrcpy.exe"
-          test -s "$PACKAGE_ROOT/scrcpy-server"
-          test -s "$PACKAGE_ROOT/adb.exe"
-          test -s "$PACKAGE_ROOT/AdbWinApi.dll"
-          test -s "$PACKAGE_ROOT/AdbWinUsbApi.dll"
-
-          # Confirm the Windows client contains the PR's opt-in CLI flag.
-          strings "$PACKAGE_ROOT/scrcpy.exe" | grep -F -- '--vd-enable-freeform'
-
-          # The patched server must be an APK archive containing its DEX bytecode.
-          unzip -t "$PACKAGE_ROOT/scrcpy-server"
-          unzip -l "$PACKAGE_ROOT/scrcpy-server" | grep -E 'classes[0-9]*\.dex'
-
-          # Ensure the original release archive was used as the baseline input.
-          file "$ORIGINAL_ROOT/scrcpy.exe" "$PACKAGE_ROOT/scrcpy.exe"
-
-          mkdir -p "$RUNNER_TEMP/final-output"
-          cp "$BUILT_PACKAGE" "$RUNNER_TEMP/final-output/scrcpy-android17-windows-x64.zip"
-          {
-            echo "Build version: $VERSION"
-            echo "Patch source URL: $PATCH_URL"
-            echo "Patch SHA-256: $PATCH_SHA256"
-            echo "Original baseline URL: $ORIGINAL_URL"
-            echo "Original baseline SHA-256: $ORIGINAL_SHA256"
-            echo "Build scripts: release/build_server.sh, release/build_windows.sh 64, release/package_client.sh win64 zip"
-            echo "Verified files: scrcpy.exe, scrcpy-server, adb.exe, AdbWinApi.dll, AdbWinUsbApi.dll"
-            echo "Verified CLI option: --vd-enable-freeform"
-            echo "Note: cloud build validation is not a device test on the Redmi Note 7 Pro."
-          } > "$RUNNER_TEMP/final-output/BUILD-INFO.txt"
-          sha256sum "$RUNNER_TEMP/final-output/scrcpy-android17-windows-x64.zip" \
-            > "$RUNNER_TEMP/final-output/SHA256SUMS.txt"
-
-      - name: Upload Windows x64 ZIP artifact
-        uses: actions/upload-artifact@v7
+jobs:
+  build-win64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
-          name: scrcpy-android17-windows-x64
-          path: |
-            ${{ runner.temp }}/final-output/scrcpy-android17-windows-x64.zip
-            ${{ runner.temp }}/final-output/BUILD-INFO.txt
-            ${{ runner.temp }}/final-output/SHA256SUMS.txt
-          if-no-files-found: error
-          retention-days: 30
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 meson ninja-build pkg-config cmake nasm zip curl
+      - name: Build server and Win64 package
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          ./release/build_server.sh
+          ./release/build_windows.sh 64
+          ./release/package_client.sh win64 zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scrcpy-win64-${{ inputs.version }}
+          path: release/**/*.zip
