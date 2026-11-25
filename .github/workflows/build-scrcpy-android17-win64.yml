@@ -5,13 +5,17 @@ on:
       version:
         description: 'Build version tag'
         required: true
-        default: 'v5.0.1-android17'
+        default: 'v5.0.1-pr7127'
 
 jobs:
   build-win64:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout KimGLee/scrcpy PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: KimGLee/scrcpy
+          ref: fix/android17-virtual-display-launch
       - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -24,6 +28,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
+          chmod +x ./release/*.sh
           ./release/build_server.sh
           ./release/build_windows.sh 64
           ./release/package_client.sh win64 zip
