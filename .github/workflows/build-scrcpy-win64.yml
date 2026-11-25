@@ -1,0 +1,97 @@
+name: Build official scrcpy v5.0.1 + Android 17 fix (Windows)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout OFFICIAL scrcpy v5.0.1
+        uses: actions/checkout@v4
+        with:
+          repository: Genymobile/scrcpy
+          ref: v5.0.1
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - name: Apply minimal fix (virtual display flags on Android 17+)
+        run: |
+          cat > fix.patch <<'PATCH_EOF'
+          diff --git a/server/src/main/java/com/genymobile/scrcpy/AndroidVersions.java b/server/src/main/java/com/genymobile/scrcpy/AndroidVersions.java
+          index 5303924a..37574df3 100644
+          --- a/server/src/main/java/com/genymobile/scrcpy/AndroidVersions.java
+          +++ b/server/src/main/java/com/genymobile/scrcpy/AndroidVersions.java
+          @@ -28,5 +28,6 @@ public final class AndroidVersions {
+               public static final int API_33_ANDROID_13 = Build.VERSION_CODES.TIRAMISU;
+               public static final int API_34_ANDROID_14 = Build.VERSION_CODES.UPSIDE_DOWN_CAKE;
+               public static final int API_35_ANDROID_15 = Build.VERSION_CODES.VANILLA_ICE_CREAM;
+          +    public static final int API_37_ANDROID_17 = 37;
+
+           }
+          diff --git a/server/src/main/java/com/genymobile/scrcpy/video/NewDisplayCapture.java b/server/src/main/java/com/genymobile/scrcpy/video/NewDisplayCapture.java
+          index 5ed4c732..0d32cee1 100644
+          --- a/server/src/main/java/com/genymobile/scrcpy/video/NewDisplayCapture.java
+          +++ b/server/src/main/java/com/genymobile/scrcpy/video/NewDisplayCapture.java
+          @@ -41,6 +41,7 @@ public class NewDisplayCapture extends SurfaceCapture {
+               private static final int VIRTUAL_DISPLAY_FLAG_TOUCH_FEEDBACK_DISABLED = 1 << 13;
+               private static final int VIRTUAL_DISPLAY_FLAG_OWN_FOCUS = 1 << 14;
+               private static final int VIRTUAL_DISPLAY_FLAG_DEVICE_DISPLAY_GROUP = 1 << 15;
+          +    private static final int VIRTUAL_DISPLAY_FLAG_ALLOWS_CONTENT_MODE_SWITCH = 1 << 17;
+
+               private final VirtualDisplayListener vdListener;
+               private final NewDisplay newDisplay;
+          @@ -210,16 +211,21 @@ public class NewDisplayCapture extends SurfaceCapture {
+
+               public void startNew(Surface surface) {
+                   try {
+          +            boolean contentModeSwitch = vdSystemDecorations && Build.VERSION.SDK_INT >= AndroidVersions.API_37_ANDROID_17;
+          +
+                       int flags = VIRTUAL_DISPLAY_FLAG_PUBLIC
+                               | VIRTUAL_DISPLAY_FLAG_PRESENTATION
+          -                    | VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+                               | VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH
+                               | VIRTUAL_DISPLAY_FLAG_ROTATES_WITH_CONTENT;
+          +            if (!contentModeSwitch) {
+          +                flags |= VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
+          +            }
+                       if (vdDestroyContent) {
+                           flags |= VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL;
+                       }
+                       if (vdSystemDecorations) {
+          -                flags |= VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS;
+          +                flags |= contentModeSwitch ? VIRTUAL_DISPLAY_FLAG_ALLOWS_CONTENT_MODE_SWITCH
+          +                        : VIRTUAL_DISPLAY_FLAG_SHOULD_SHOW_SYSTEM_DECORATIONS;
+                       }
+                       if (Build.VERSION.SDK_INT >= AndroidVersions.API_33_ANDROID_13) {
+                           flags |= VIRTUAL_DISPLAY_FLAG_TRUSTED
+          PATCH_EOF
+          git apply --check fix.patch
+          git apply fix.patch
+          git --no-pager diff --stat
+
+      # The bug is in the SERVER (Java, runs on the phone), so this is the only
+      # part that needs rebuilding. scrcpy.exe stays the official one.
+      - name: Build scrcpy-server
+        run: |
+          export VERSION=v5.0.1
+          release/build_server.sh
+
+      - name: Download official Windows release and swap in patched server
+        run: |
+          curl -fsSL -o official.zip https://github.com/Genymobile/scrcpy/releases/download/v5.0.1/scrcpy-win64-v5.0.1.zip
+          unzip -q official.zip
+          cp release/work/build-server/server/scrcpy-server scrcpy-win64-v5.0.1/scrcpy-server
+          zip -qr scrcpy-win64-v5.0.1-android17-fix.zip scrcpy-win64-v5.0.1
+          ls -la scrcpy-win64-v5.0.1-android17-fix.zip
+
+      - name: Upload final zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrcpy-win64-v5.0.1-android17-fix
+          path: scrcpy-win64-v5.0.1-android17-fix.zip
+          if-no-files-found: error
