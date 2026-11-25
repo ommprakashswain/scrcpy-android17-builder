@@ -16,23 +16,25 @@ jobs:
         with:
           repository: KimGLee/scrcpy
           ref: fix/android17-virtual-display-launch
-      - uses: actions/setup-java@v4
+          path: .
+      - uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 meson ninja-build pkg-config cmake nasm zip curl
+          sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 meson ninja-build pkg-config cmake nasm zip curl git python3-pip python3-venv
       - name: Build server and Win64 package
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          chmod +x ./release/*.sh
+          chmod +x ./release/*.sh ./app/deps/*.sh
           ./release/build_server.sh
+          ./app/deps/dav1d.sh 64 cross shared
           ./release/build_windows.sh 64
           ./release/package_client.sh win64 zip
       - uses: actions/upload-artifact@v4
         with:
           name: scrcpy-win64-${{ inputs.version }}
-          path: release/**/*.zip
+          path: release/output/scrcpy-win64-*.zip
