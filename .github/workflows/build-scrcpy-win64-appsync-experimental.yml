@@ -635,10 +635,11 @@ jobs:
           pause
 
           adb.exe start-server >nul 2>&1
-          adb.exe tcpip 5555
+          adb.exe -d tcpip 5555
           if errorlevel 1 (
               echo.
-              echo Failed. Check that ONE phone is plugged in and USB debugging is allowed.
+              echo Failed. Check that the phone is plugged in with the cable and USB debugging is allowed.
+          echo If you use two phones or an emulator, unplug the other one and try again.
               pause
               exit /b 1
           )
