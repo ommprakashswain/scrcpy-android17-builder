@@ -1,7 +1,8 @@
-name: EXPERIMENTAL - Android desktop zip with apps sync
+name: EXPERIMENTAL - Android desktop zip (apps sync, floating windows, wireless hotspot)
 
 # Takes YOUR latest release zip (scrcpy-win64-v5.0.1-android17.zip) and
 # replaces only scrcpy-server with a build that also moves phone apps to the desktop.
+# Adds the SYNC launcher (USB or wireless over the phone hotspot) and the one-time wireless setup.
 
 on:
   workflow_dispatch:
@@ -80,11 +81,11 @@ jobs:
           git apply --check fix1.patch
           git apply fix1.patch
 
-      - name: Apply patch 2 (EXPERIMENTAL - move phone apps to the desktop)
+      - name: Apply patch 2 (EXPERIMENTAL - move phone apps to the desktop as windows)
         run: |
           cat > fix2.patch <<'PATCH2_EOF'
           diff --git a/server/src/main/java/com/genymobile/scrcpy/video/NewDisplayCapture.java b/server/src/main/java/com/genymobile/scrcpy/video/NewDisplayCapture.java
-          index 0d32cee1..22c98bf3 100644
+          index 0d32cee1..5a78051e 100644
           --- a/server/src/main/java/com/genymobile/scrcpy/video/NewDisplayCapture.java
           +++ b/server/src/main/java/com/genymobile/scrcpy/video/NewDisplayCapture.java
           @@ -17,6 +17,7 @@ import com.genymobile.scrcpy.opengl.OpenGLRunner;
@@ -101,7 +102,7 @@ jobs:
 
           +            // Experimental: bring the apps open on the phone to the new display (only if enabled by the launcher script)
           +            if (TaskMover.isEnabled()) {
-          +                TaskMover.moveAppsAsync(virtualDisplayId);
+          +                TaskMover.moveAppsAsync(virtualDisplayId, displaySize.getWidth(), displaySize.getHeight());
           +            }
           +
                        displayMonitor.start(virtualDisplayId, (props) -> {
@@ -109,15 +110,17 @@ jobs:
                            if (flexDisplay) {
           diff --git a/server/src/main/java/com/genymobile/scrcpy/wrappers/TaskMover.java b/server/src/main/java/com/genymobile/scrcpy/wrappers/TaskMover.java
           new file mode 100644
-          index 00000000..1a46c107
+          index 00000000..0b5d0c1a
           --- /dev/null
           +++ b/server/src/main/java/com/genymobile/scrcpy/wrappers/TaskMover.java
-          @@ -0,0 +1,201 @@
+          @@ -0,0 +1,334 @@
           +package com.genymobile.scrcpy.wrappers;
           +
           +import com.genymobile.scrcpy.util.Ln;
           +
           +import android.annotation.SuppressLint;
+          +import android.graphics.Rect;
+          +import android.os.Bundle;
           +import android.os.IInterface;
           +
           +import java.io.File;
@@ -135,16 +138,23 @@ jobs:
           + * Android APIs, so it can differ between Android versions: any failure is logged and ignored, it never breaks the mirroring.
           + * <p>
           + * Only "standard" apps (activity type 1) are moved: the home screen, recents and SystemUI are never touched.
+          + * <p>
+          + * If the second marker file exists, apps are moved as floating (freeform) windows. If that is not possible, they are simply moved (maximized).
           + */
           +@SuppressLint("PrivateApi,DiscouragedPrivateApi")
           +public final class TaskMover {
           +
           +    private static final String MARKER_FILE = "/data/local/tmp/scrcpy_move_apps";
+          +    private static final String WINDOWED_MARKER_FILE = "/data/local/tmp/scrcpy_move_windowed";
           +
           +    private static final int DEFAULT_DISPLAY = 0;
           +    private static final int ACTIVITY_TYPE_STANDARD = 1;
+          +    private static final int WINDOWING_MODE_FREEFORM = 5;
           +    private static final int MAX_TASKS = 100;
           +    private static final long DELAY_MS = 1500;
+          +    private static final long STEP_DELAY_MS = 150;
+          +
+          +    private static boolean floatingFailureLogged;
           +
           +    private TaskMover() {
           +        /* not instantiable */
@@ -157,11 +167,12 @@ jobs:
           +    /**
           +     * Move the apps in a background thread, after a short delay so that the new display is ready.
           +     */
-          +    public static void moveAppsAsync(int targetDisplayId) {
+          +    public static void moveAppsAsync(int targetDisplayId, int displayWidth, int displayHeight) {
           +        Thread thread = new Thread(() -> {
           +            try {
           +                Thread.sleep(DELAY_MS);
-          +                moveApps(targetDisplayId);
+          +                boolean windowed = new File(WINDOWED_MARKER_FILE).exists();
+          +                moveApps(targetDisplayId, displayWidth, displayHeight, windowed);
           +            } catch (InterruptedException e) {
           +                Thread.currentThread().interrupt();
           +            } catch (Throwable e) {
@@ -172,10 +183,10 @@ jobs:
           +        thread.start();
           +    }
           +
-          +    static void moveApps(int targetDisplayId) {
+          +    static void moveApps(int targetDisplayId, int displayWidth, int displayHeight, boolean windowed) throws InterruptedException {
           +        IInterface atm = ServiceManager.getService("activity_task", "android.app.IActivityTaskManager");
           +
-          +        List<?> tasks = getTasks(atm);
+          +        List<?> tasks = getTasks(atm, DEFAULT_DISPLAY);
           +        if (tasks == null) {
           +            Ln.w("Could not list the running apps: not moving anything");
           +            return;
@@ -212,7 +223,8 @@ jobs:
           +        }
           +
           +        Method moveMethod = findMoveMethod(atm);
-          +        if (moveMethod == null) {
+          +        Method recentsMethod = findStartFromRecentsMethod(atm);
+          +        if (moveMethod == null && !(windowed && recentsMethod != null)) {
           +            Ln.w("Moving apps between displays is not supported by this Android version");
           +            return;
           +        }
@@ -221,20 +233,132 @@ jobs:
           +        Collections.reverse(taskIds);
           +
           +        int moved = 0;
+          +        int floating = 0;
+          +        int unknownMode = 0;
+          +        int index = 0;
           +        for (int taskId : taskIds) {
-          +            try {
-          +                moveMethod.invoke(atm, taskId, targetDisplayId);
-          +                moved++;
-          +            } catch (InvocationTargetException e) {
-          +                Ln.w("Could not move task " + taskId, e.getCause() != null ? e.getCause() : e);
-          +            } catch (ReflectiveOperationException e) {
-          +                Ln.w("Could not move task " + taskId, e);
+          +            Rect bounds = cascadeBounds(displayWidth, displayHeight, index++);
+          +            boolean done = false;
+          +
+          +            if (windowed && recentsMethod != null) {
+          +                // Moves the task to the display AND asks for a floating window
+          +                if (launchFromRecents(atm, recentsMethod, taskId, targetDisplayId, bounds) && isOnDisplay(atm, taskId, targetDisplayId)) {
+          +                    done = true;
+          +                }
           +            }
+          +
+          +            if (!done && moveMethod != null) {
+          +                try {
+          +                    moveMethod.invoke(atm, taskId, targetDisplayId);
+          +                    done = true;
+          +                } catch (InvocationTargetException e) {
+          +                    Ln.w("Could not move task " + taskId, e.getCause() != null ? e.getCause() : e);
+          +                } catch (ReflectiveOperationException e) {
+          +                    Ln.w("Could not move task " + taskId, e);
+          +                }
+          +                if (done && windowed && recentsMethod != null) {
+          +                    // Already on the display: just try to turn it into a floating window
+          +                    Thread.sleep(STEP_DELAY_MS);
+          +                    launchFromRecents(atm, recentsMethod, taskId, targetDisplayId, bounds);
+          +                }
+          +            }
+          +
+          +            if (done) {
+          +                moved++;
+          +                if (windowed) {
+          +                    Thread.sleep(STEP_DELAY_MS);
+          +                    // Report what Android really did, not what we asked for
+          +                    Integer mode = getWindowingMode(atm, taskId, targetDisplayId);
+          +                    if (mode == null) {
+          +                        unknownMode++;
+          +                    } else if (mode == WINDOWING_MODE_FREEFORM) {
+          +                        floating++;
+          +                    }
+          +                }
+          +            }
+          +            Thread.sleep(STEP_DELAY_MS);
           +        }
-          +        Ln.i("Moved " + moved + "/" + taskIds.size() + " app(s) to display " + targetDisplayId);
+          +        String detail = "";
+          +        if (windowed) {
+          +            detail = " (floating windows: " + floating + (unknownMode > 0 ? ", unknown: " + unknownMode : "") + ")";
+          +        }
+          +        Ln.i("Moved " + moved + "/" + taskIds.size() + " app(s) to display " + targetDisplayId + detail);
           +    }
           +
-          +    private static List<?> getTasks(IInterface atm) {
+          +    private static Rect cascadeBounds(int width, int height, int index) {
+          +        // A window of 70% x 70% of the display, each new one slightly shifted
+          +        int step = Math.min(index, 6) * Math.max(24, width / 40);
+          +        int left = width / 10 + step;
+          +        int top = height / 14 + step;
+          +        return new Rect(left, top, left + width * 7 / 10, top + height * 7 / 10);
+          +    }
+          +
+          +    private static boolean launchFromRecents(IInterface atm, Method startFromRecents, int taskId, int displayId, Rect bounds) {
+          +        try {
+          +            Class<?> optionsClass = Class.forName("android.app.ActivityOptions");
+          +            Object options = optionsClass.getMethod("makeBasic").invoke(null);
+          +            optionsClass.getMethod("setLaunchDisplayId", int.class).invoke(options, displayId);
+          +            optionsClass.getMethod("setLaunchWindowingMode", int.class).invoke(options, WINDOWING_MODE_FREEFORM);
+          +            optionsClass.getMethod("setLaunchBounds", Rect.class).invoke(options, bounds);
+          +            Bundle bundle = (Bundle) optionsClass.getMethod("toBundle").invoke(options);
+          +
+          +            Object result = startFromRecents.invoke(atm, taskId, bundle);
+          +            // ActivityManager.START_* result codes: negative means error
+          +            return !(result instanceof Integer) || (Integer) result >= 0;
+          +        } catch (InvocationTargetException e) {
+          +            logFloatingFailure(taskId, e.getCause() != null ? e.getCause() : e);
+          +            return false;
+          +        } catch (ReflectiveOperationException | RuntimeException e) {
+          +            logFloatingFailure(taskId, e);
+          +            return false;
+          +        }
+          +    }
+          +
+          +    private static void logFloatingFailure(int taskId, Throwable e) {
+          +        // Show the first failure as a warning (useful to diagnose), the next ones only in debug mode
+          +        if (!floatingFailureLogged) {
+          +            floatingFailureLogged = true;
+          +            Ln.w("Floating window not available (task " + taskId + "), keeping the app maximized", e);
+          +        } else {
+          +            Ln.d("Floating window failed for task " + taskId + ": " + e);
+          +        }
+          +    }
+          +
+          +    private static Integer getWindowingMode(IInterface atm, int taskId, int displayId) {
+          +        List<?> tasks = getTasks(atm, displayId);
+          +        if (tasks == null) {
+          +            return null;
+          +        }
+          +        for (Object task : tasks) {
+          +            Integer id = getIntField(task, "taskId");
+          +            if (id != null && id == taskId) {
+          +                try {
+          +                    Object configuration = task.getClass().getField("configuration").get(task);
+          +                    Object windowConfiguration = configuration.getClass().getField("windowConfiguration").get(configuration);
+          +                    return (Integer) windowConfiguration.getClass().getMethod("getWindowingMode").invoke(windowConfiguration);
+          +                } catch (ReflectiveOperationException | RuntimeException e) {
+          +                    return null;
+          +                }
+          +            }
+          +        }
+          +        return null;
+          +    }
+          +
+          +    private static boolean isOnDisplay(IInterface atm, int taskId, int displayId) {
+          +        List<?> tasks = getTasks(atm, displayId);
+          +        if (tasks == null) {
+          +            return false;
+          +        }
+          +        for (Object task : tasks) {
+          +            Integer id = getIntField(task, "taskId");
+          +            if (id != null && id == taskId) {
+          +                return true;
+          +            }
+          +        }
+          +        return false;
+          +    }
+          +
+          +    private static List<?> getTasks(IInterface atm, int displayId) {
           +        List<Method> candidates = new ArrayList<>();
           +        for (Method method : atm.getClass().getMethods()) {
           +            if (method.getName().equals("getTasks")) {
@@ -252,7 +376,7 @@ jobs:
           +            for (int i = 0; i < types.length; ++i) {
           +                if (types[i] == int.class) {
           +                    // first int: maxNum, next int: displayId
-          +                    args[i] = firstInt ? MAX_TASKS : DEFAULT_DISPLAY;
+          +                    args[i] = firstInt ? MAX_TASKS : displayId;
           +                    firstInt = false;
           +                } else if (types[i] == boolean.class) {
           +                    args[i] = false;
@@ -285,6 +409,16 @@ jobs:
           +                if (method.getName().equals(name) && types.length == 2 && types[0] == int.class && types[1] == int.class) {
           +                    return method;
           +                }
+          +            }
+          +        }
+          +        return null;
+          +    }
+          +
+          +    private static Method findStartFromRecentsMethod(IInterface atm) {
+          +        for (Method method : atm.getClass().getMethods()) {
+          +            Class<?>[] types = method.getParameterTypes();
+          +            if (method.getName().equals("startActivityFromRecents") && types.length == 2 && types[0] == int.class && types[1] == Bundle.class) {
+          +                return method;
           +            }
           +        }
           +        return null;
@@ -338,10 +472,10 @@ jobs:
           echo "Base folder: $DIR"
           echo "BASE_DIR=$DIR" >> "$GITHUB_ENV"
 
-      - name: Swap in the new server and add the SYNC launcher
+      - name: Swap in the new server and add the launchers
         run: |
           cp release/work/build-server/server/scrcpy-server "$BASE_DIR/scrcpy-server"
-          cat > "$BASE_DIR/Start-Android-Desktop-SYNC.bat" <<'BAT_EOF'
+          cat > "$BASE_DIR/Start-Android-Desktop-SYNC.bat" <<'BAT1_EOF'
           @echo off
           title Android Desktop SYNC (experimental)
 
@@ -349,10 +483,29 @@ jobs:
           cd /d "%~dp0"
 
           REM ===== EDIT THESE IF YOU WANT =====
+
+          REM How to connect:
+          REM   AUTO     = USB cable if plugged in, otherwise wireless (phone hotspot)
+          REM   USB      = cable only
+          REM   WIRELESS = hotspot only
+          set CONNECTION=AUTO
+
+          REM Phone address on its own hotspot. Leave empty = find it automatically.
+          set PHONE_IP=
+          set PORT=5555
+
+          REM Quality with the USB cable
           set SIZE=2560x1440
           set DPI=320
           set FPS=60
           set BITRATE=20M
+
+          REM Quality over the hotspot (lighter, so it stays smooth)
+          set W_SIZE=1920x1080
+          set W_DPI=240
+          set W_FPS=60
+          set W_BITRATE=8M
+
           set KEYBOARD=--keyboard=uhid
           set IME=--display-ime-policy=hide
           set MOUSE=
@@ -360,36 +513,149 @@ jobs:
           REM 1 = move the apps open on your phone to the desktop when it starts
           REM 0 = normal desktop (no moving)
           set SYNC_APPS=1
+
+          REM 1 = moved apps open as floating windows
+          REM 0 = moved apps open maximized
+          set WINDOWED=1
+
           REM ==================================
 
-          if "%SYNC_APPS%"=="1" (
-              adb.exe shell touch /data/local/tmp/scrcpy_move_apps
-          ) else (
-              adb.exe shell rm -f /data/local/tmp/scrcpy_move_apps
+          adb.exe start-server >nul 2>&1
+
+          REM ----- look for a phone connected with a USB cable -----
+          set USB_SERIAL=
+          for /f "tokens=1,2" %%a in ('adb.exe devices') do (
+              if "%%b"=="device" (
+                  echo %%a| findstr /c:":" >nul
+                  if errorlevel 1 set USB_SERIAL=%%a
+              )
           )
-          if errorlevel 1 (
+
+          if /i "%CONNECTION%"=="USB" goto USB_MODE
+          if /i "%CONNECTION%"=="WIRELESS" goto WIRELESS_MODE
+          if defined USB_SERIAL goto USB_MODE
+          goto WIRELESS_MODE
+
+
+          :USB_MODE
+          if not defined USB_SERIAL (
               echo.
-              echo Phone not found. Plug it in, turn on USB debugging and tap Allow.
+              echo No phone found on the USB cable.
+              echo Plug it in, turn on USB debugging and tap Allow.
+              pause
+              exit /b 1
+          )
+          set SERIAL=%USB_SERIAL%
+          set MODE_NAME=USB cable
+          goto START
+
+
+          :WIRELESS_MODE
+          set SIZE=%W_SIZE%
+          set DPI=%W_DPI%
+          set FPS=%W_FPS%
+          set BITRATE=%W_BITRATE%
+          set MODE_NAME=Wireless - phone hotspot
+
+          set IP=%PHONE_IP%
+          if not defined IP for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1).NextHop"`) do set IP=%%i
+          if "%IP%"=="0.0.0.0" set IP=
+
+          if not defined IP (
+              echo.
+              echo Could not find the phone address.
+              echo Connect this PC to the phone hotspot,
+              echo or write the phone IP in PHONE_IP at the top of this file.
               pause
               exit /b 1
           )
 
+          echo Connecting to the phone at %IP%:%PORT% ...
+          adb.exe connect %IP%:%PORT% > "%TEMP%\scrcpy_adb_connect.txt" 2>&1
+          type "%TEMP%\scrcpy_adb_connect.txt"
+          findstr /i /c:"connected to" "%TEMP%\scrcpy_adb_connect.txt" >nul
+          if errorlevel 1 (
+              echo.
+              echo Could not connect to the phone. Check these:
+              echo  1. This PC is connected to the PHONE hotspot, not another Wi-Fi.
+              echo  2. You ran Wireless-Setup-Once.bat with the USB cable after the last phone restart.
+              echo  3. The phone screen is on and the hotspot is on.
+              echo  4. If the address above is wrong, write the phone IP in PHONE_IP.
+              pause
+              exit /b 1
+          )
+          set SERIAL=%IP%:%PORT%
+          goto START
+
+
+          :START
+          set M1=/data/local/tmp/scrcpy_move_apps
+          set M2=/data/local/tmp/scrcpy_move_windowed
+          if "%SYNC_APPS%"=="1" (set CMD=touch %M1%) else (set CMD=rm -f %M1%)
+          if "%WINDOWED%"=="1" (set CMD=%CMD%; touch %M2%) else (set CMD=%CMD%; rm -f %M2%)
+
+          adb.exe -s %SERIAL% shell "%CMD%"
+          if errorlevel 1 (
+              echo.
+              echo The phone did not answer. Check the connection and try again.
+              pause
+              exit /b 1
+          )
+
+          echo.
+          echo Connection: %MODE_NAME%
           echo Starting Android Desktop: %SIZE% / %DPI% dpi, %FPS% FPS, %BITRATE%
-          echo Move phone apps to desktop: %SYNC_APPS%
+          echo Move phone apps to desktop: %SYNC_APPS%   Floating windows: %WINDOWED%
           echo When you close this window, the apps go back to your phone.
           echo.
 
           REM --no-vd-destroy-content = apps go back to the phone when the desktop closes
-          scrcpy.exe --new-display=%SIZE%/%DPI% --max-fps=%FPS% --video-bit-rate=%BITRATE% --no-vd-destroy-content %KEYBOARD% %IME% %MOUSE%
+          scrcpy.exe -s %SERIAL% --new-display=%SIZE%/%DPI% --max-fps=%FPS% --video-bit-rate=%BITRATE% --no-vd-destroy-content %KEYBOARD% %IME% %MOUSE%
 
           if errorlevel 1 (
               echo.
               echo scrcpy stopped with an error. Read the message above.
               pause
           )
-          BAT_EOF
+          BAT1_EOF
+          cat > "$BASE_DIR/Wireless-Setup-Once.bat" <<'BAT2_EOF'
+          @echo off
+          title Wireless setup (do this once)
+
+          REM === Always run from the folder this file is in ===
+          cd /d "%~dp0"
+
+          echo ============================================
+          echo   WIRELESS SETUP - needs the USB cable once
+          echo ============================================
+          echo.
+          echo 1. Plug your phone into this PC with the USB cable.
+          echo 2. Make sure USB debugging is ON and tap Allow on the phone.
+          echo.
+          pause
+
+          adb.exe start-server >nul 2>&1
+          adb.exe tcpip 5555
+          if errorlevel 1 (
+              echo.
+              echo Failed. Check that ONE phone is plugged in and USB debugging is allowed.
+              pause
+              exit /b 1
+          )
+
+          echo.
+          echo Done! Now:
+          echo   1. UNPLUG the USB cable.
+          echo   2. Turn ON the hotspot on your phone.
+          echo   3. Connect this PC to that hotspot.
+          echo   4. Double-click Start-Android-Desktop-SYNC.bat
+          echo.
+          echo You only need to repeat this setup after the phone restarts.
+          echo.
+          pause
+          BAT2_EOF
           # Windows batch files need CRLF line endings
-          sed -i 's/$/\r/' "$BASE_DIR/Start-Android-Desktop-SYNC.bat"
+          sed -i 's/$/\r/' "$BASE_DIR/Start-Android-Desktop-SYNC.bat" "$BASE_DIR/Wireless-Setup-Once.bat"
           mkdir -p out
           rm -rf out/scrcpy-win64-v5.0.1-android17-appsync
           cp -r "$BASE_DIR" out/scrcpy-win64-v5.0.1-android17-appsync
