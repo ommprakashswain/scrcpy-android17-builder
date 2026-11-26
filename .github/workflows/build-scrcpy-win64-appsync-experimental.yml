@@ -518,6 +518,14 @@ jobs:
           REM 0 = moved apps open maximized
           set WINDOWED=1
 
+          REM 1 = keep the phone awake so the desktop never goes black.
+          REM     The phone PANEL turns off, but the phone stays awake inside.
+          REM 0 = normal phone behavior (the desktop can go black when the phone sleeps)
+          set KEEP_AWAKE=1
+          REM How long the phone stays awake, in seconds (86400 = 24 hours).
+          REM Your normal timeout comes back when you close the desktop.
+          set AWAKE_SECONDS=86400
+
           REM ==================================
 
           adb.exe start-server >nul 2>&1
@@ -581,6 +589,8 @@ jobs:
               echo  2. You ran Wireless-Setup-Once.bat with the USB cable after the last phone restart.
               echo  3. The phone screen is on and the hotspot is on.
               echo  4. If the address above is wrong, write the phone IP in PHONE_IP.
+              echo.
+              echo Note: No internet on the PC is normal and does not matter. This works offline.
               pause
               exit /b 1
           )
@@ -594,6 +604,8 @@ jobs:
           if "%SYNC_APPS%"=="1" (set CMD=touch %M1%) else (set CMD=rm -f %M1%)
           if "%WINDOWED%"=="1" (set CMD=%CMD%; touch %M2%) else (set CMD=%CMD%; rm -f %M2%)
 
+          if "%KEEP_AWAKE%"=="1" (set AWAKE_OPTS=--turn-screen-off --stay-awake --screen-off-timeout=%AWAKE_SECONDS%) else (set AWAKE_OPTS=)
+
           adb.exe -s %SERIAL% shell "%CMD%"
           if errorlevel 1 (
               echo.
@@ -606,11 +618,12 @@ jobs:
           echo Connection: %MODE_NAME%
           echo Starting Android Desktop: %SIZE% / %DPI% dpi, %FPS% FPS, %BITRATE%
           echo Move phone apps to desktop: %SYNC_APPS%   Floating windows: %WINDOWED%
+          echo Keep phone awake: %KEEP_AWAKE%
           echo When you close this window, the apps go back to your phone.
           echo.
 
           REM --no-vd-destroy-content = apps go back to the phone when the desktop closes
-          scrcpy.exe -s %SERIAL% --new-display=%SIZE%/%DPI% --max-fps=%FPS% --video-bit-rate=%BITRATE% --no-vd-destroy-content %KEYBOARD% %IME% %MOUSE%
+          scrcpy.exe -s %SERIAL% --new-display=%SIZE%/%DPI% --max-fps=%FPS% --video-bit-rate=%BITRATE% --no-vd-destroy-content %AWAKE_OPTS% %KEYBOARD% %IME% %MOUSE%
 
           if errorlevel 1 (
               echo.
